@@ -1,0 +1,145 @@
+#!/bin/bash
+##########################################
+## おおよその使用帯域幅を計測するスクリプトです。
+## 使い方:
+##   nrpe.cfgに下記のような定義を追加してください。
+##   例１
+##      単位が%
+##          command[check_traffic]=$0 -i eth0 -w 70% -c 90%
+##   例２
+##      単位がM
+##          command[check_traffic]=$0 -i eth1 -w 700M -c 900M
+##
+##   デフォルトでは1回前にスクリプトを実行した時間から実行時までに発生したトラフィック量で、使用帯域幅を計測しています
+##   直近一秒間でのトラフィック量で計測したい場合は[-s]をつけてください。
+## 備考:
+##    32bitOSの場合、 `/proc/net/net` の値がリセットされるタイミングが早いです。
+##   スクリプトでは1度リセットされる可能性があることを想定していますが、複数回は想定していません。
+##   100MBps以上の通信が定常的に行われる32bitOSサーバについては、
+##   監視間隔を調整するか[-s]オプションを使用した監視を行ってください。
+##    閾値末尾の単位を省略した場合はMbps計算になります。
+## Author: Yokoo Mizuki
+###################################
+
+readonly STATUS_UNKNOWN=-1
+readonly STATUS_OK=0
+readonly STATUS_WARNING=1
+readonly STATUS_CRITICAL=2
+readonly LEVERAGE=1000000
+
+interface_target="eth0"
+warning_threshold=$((  ${LEVERAGE} * 70 ))
+critical_threshold=$(( ${LEVERAGE} * 90 ))
+data_dir="/var/tmp/check_traffic"
+data_file=".traffic.${interface_target}"
+second_flag=0
+warning_flag=0   #0: 閾値をMbpsで計算 1: 閾値を%で計算
+critical_flag=0  #0: 閾値をMbpsで計算 1: 閾値を%で計算
+warning_arg=0
+critical_arg=0
+
+exit_status=-1
+
+usage_exit() {
+  echo "Usage: $0 [-i <interface>] [-w <xx(M|%)>] [-c <xx(M|%)>] [Optional: -s]" 1>&2
+  echo "Ex: $0 -i eth0 -w 300M -c 800M" 1>&2
+  echo "Ex: $0 -i eth0 -w 70% -c 90%" 1>&2
+  echo "Option s to aggregate per second of data." 1>&2
+  exit -1
+}
+
+## インターフェース名と最初の数値がくっついている場合があるので、一度切り離して処理する
+set_data() {
+  result=$(awk -F: -v target="  $1" '$1==target{print $2}' /proc/net/dev | \
+             awk -v date=$(date +%s) '{printf "%s %s %s\n",date,$1,$9}' | \
+             tee ${data_dir}/${data_file}
+          )
+}
+
+## 前回計測値と実行時の転送量を$last_data, $now_dataに設定
+get_data_average() {
+  [ ! -f  ${data_dir}/${data_file} ] && get_data_per_second
+  last_data=($(cat ${data_dir}/${data_file}))
+  set_data ${interface_target}
+  now_data=($(echo ${result}))
+}
+
+## 直近一秒間(-s オプション)用。転送量を$last_data, $now_dataに設定
+get_data_per_second() {
+  set_data ${interface_target}
+  last_data=($(echo ${result}))
+  sleep 1s
+  set_data ${interface_target}
+  now_data=($(echo ${result}))
+}
+
+## 引数で渡された転送量から帯域使用量(bps)を計算
+calculate_traffic_bandwidth() {
+  local new_count=$1
+  local old_count=$2
+  local elapsed_time=$3
+  local limit=$4
+
+  tmp_result=$(expr ${new_count} - ${old_count} )
+  [ ${tmp_result} -lt 0 ] && tmp_result=$(expr ${limit} + ${new_count} - ${old_count} )
+  calculate_result=$(expr ${tmp_result} \* 8 \/ ${elapsed_time} )
+}
+
+## warningとcriticalの判定をする閾値を$warning_threshold, $critical_thresholdに設定
+set_threshold() {
+  [ ${warning_flag}  -eq 1 ] \
+    && warning_threshold=$((  ${LEVERAGE} * ${warning_arg}  / 100 * ${nic_speed} )) \
+    || warning_threshold=$((  ${LEVERAGE} * ${warning_arg}  ))
+  [ ${critical_flag} -eq 1 ] \
+    && critical_threshold=$(( ${LEVERAGE} * ${critical_arg} / 100 * ${nic_speed} )) \
+    || critical_threshold=$(( ${LEVERAGE} * ${critical_arg} ))
+}
+
+while getopts :i:w:c:hs OPT
+do
+  case $OPT in
+    i) interface_target=${OPTARG}
+       data_file=".traffic.${interface_target}" ;;
+    w) warning_arg=${OPTARG/%[M%]/} ; [ "${OPTARG: -1}" = "%" ] && warning_flag=1  ;;
+    c) critical_arg=${OPTARG/%[M%]/}; [ "${OPTARG: -1}" = "%" ] && critical_flag=1 ;;
+    s) second_flag=1 ;;
+   \?) usage_exit ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+
+## メイン処理
+# %で指定された場合、nicのspeedを拾う必要がある
+if [ ${warning_flag} -eq 1 -o ${critical_flag} -eq 1 ];then
+  # nicのSppedを拾う：単位はMb
+  nic_speed=$( /sbin/ethtool ${interface_target} | sed -n 's/^.*Speed: \([0-9]\+\).*$/\1/p' )
+fi
+
+set_threshold # 閾値を算出
+
+[ ! -d ${data_dir} ] && mkdir -p ${data_dir}
+[ ${second_flag} -eq 0  ] && get_data_average || get_data_per_second
+[ $(uname -i) = "i386" ] && limit_number=4294967295 || limit_number=18446744073709551616
+
+s_time=$(( ${now_data[0]} - ${last_data[0]} ))
+[ ${s_time} -eq 0 ] && s_time=1
+
+calculate_traffic_bandwidth ${now_data[1]} ${last_data[1]} ${s_time} ${limit_number}
+sabun_rx=${calculate_result}
+
+calculate_traffic_bandwidth ${now_data[2]} ${last_data[2]} ${s_time} ${limit_number}
+sabun_tx=${calculate_result}
+
+if [ ${sabun_rx} -ge ${critical_threshold} -o ${sabun_tx} -ge ${critical_threshold} ];then
+  exit_status=${STATUS_CRITICAL}
+elif [ ${sabun_rx} -ge ${warning_threshold} -o ${sabun_tx} -ge ${warning_threshold} ];then
+  exit_status=${STATUS_WARNING}
+elif [ ${sabun_rx} -ge 0 -a ${sabun_tx} -ge 0 ];then
+  exit_status=${STATUS_OK}
+else
+  exit_status=${STATUS_UNKNOWN}
+fi
+
+echo "Interface:${interface_target}, RX: $(printf "%'d\n" ${sabun_rx})bps, TX: $(printf "%'d\n" ${sabun_tx})bps"
+exit ${exit_status}
